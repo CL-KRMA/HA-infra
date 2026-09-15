@@ -1,0 +1,166 @@
+---
+- name: Installer ArgoCD sur le master k3s
+  hosts: "{{ groups['master'][0] }}"
+  become: yes
+  vars:
+    kube_user: "ubuntu"
+    kubeconfig_path: "/home/ubuntu/.kube/config"
+    helm_version: "v3.15.4"
+    argocd_hostname: "argocd.domain.com"
+
+  tasks:
+    # --- Installer Helm (idempotent, version pinnee) ---
+    - name: Telecharger script d'installation Helm
+      get_url:
+        url: "https://raw.githubusercontent.com/helm/helm/{{ helm_version }}/scripts/get-helm-3"
+        dest: /tmp/get_helm.sh
+        mode: '0755'
+
+    - name: Installer Helm
+      command: /tmp/get_helm.sh
+      args:
+        creates: /usr/local/bin/helm
+      environment:
+        DESIRED_VERSION: "{{ helm_version }}"
+
+    # --- Ajouter repo ArgoCD (idempotent) ---
+    - name: Ajouter le repo Helm ArgoCD
+      command: helm repo add argo https://argoproj.github.io/argo-helm
+      register: repo_add
+      changed_when: "'has been added' in repo_add.stdout"
+      failed_when: repo_add.rc != 0 and 'already exists' not in repo_add.stderr
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Mettre a jour les repos Helm
+      command: helm repo update
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    # --- Installer/mettre a jour ArgoCD ---
+    # server.service.type reste ClusterIP (pas de NodePort) : l'acces
+    # externe passe par un Ingress Traefik HTTP classique (port 80),
+    # comme pour Grafana.
+    #
+    # ATTENTION SECURITE : server.insecure=true fait servir ArgoCD en
+    # HTTP simple (pas de TLS interne). Les identifiants de connexion
+    # circulent alors en clair sur le reseau. Acceptable en dev/interne,
+    # deconseille si le cluster est expose publiquement sur Internet.
+    # Pour du HTTPS avec le port 443, repasser server.insecure=false et
+    # utiliser l'IngressRouteTCP en TLS passthrough (version precedente).
+    - name: Deployer/mettre a jour ArgoCD via Helm
+      command: >
+        helm upgrade --install argocd argo/argo-cd
+        --namespace argocd --create-namespace
+        --set server.service.type=ClusterIP
+        --set configs.params."server\.insecure"=true
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    # --- Ingress Traefik HTTPS (port 443) vers argocd.domain.com,
+    #     certificat Let's Encrypt gere automatiquement par
+    #     cert-manager (ClusterIssuer letsencrypt-prod, voir
+    #     playbooks/install-cert-manager.yml, doit tourner AVANT
+    #     ce playbook). Le TLS est termine par Traefik ; le trafic
+    #     Ingress -> service argocd-server reste en HTTP interne
+    #     au cluster (server.insecure=true ci-dessus reste donc
+    #     approprie, cf. note securite plus haut).
+    - name: Deployer le manifest Ingress pour ArgoCD
+      copy:
+        dest: /tmp/argocd-ingress.yaml
+        content: |
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argocd-server-ingress
+            namespace: argocd
+            annotations:
+              traefik.ingress.kubernetes.io/router.entrypoints: websecure
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+          spec:
+            ingressClassName: traefik
+            tls:
+              - hosts:
+                  - {{ argocd_hostname }}
+                secretName: argocd-server-tls
+            rules:
+              - host: {{ argocd_hostname }}
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: argocd-server
+                          port:
+                            number: 80
+
+    - name: Appliquer l'Ingress ArgoCD
+      command: kubectl apply -f /tmp/argocd-ingress.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    # --- Verifications ---
+    - name: Attendre que les pods ArgoCD soient prets
+      command: kubectl get pods -n argocd
+      register: result
+      retries: 20
+      delay: 15
+      until: "'ContainerCreating' not in result.stdout and 'Pending' not in result.stdout"
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - debug:
+        msg: "{{ result.stdout }}"
+
+    - name: Verifier le service ArgoCD
+      command: kubectl get svc -n argocd argocd-server
+      register: argocd_svc
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - debug:
+        msg: "{{ argocd_svc.stdout }}"
+
+    # --- Verifier que le certificat Let's Encrypt a bien ete emis ---
+    - name: Attendre que le certificat TLS ArgoCD soit Ready
+      command: kubectl get certificate -n argocd argocd-server-tls -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}"
+      register: cert_status
+      retries: 15
+      delay: 15
+      until: cert_status.stdout == "True"
+      changed_when: false
+      failed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Avertissement si le certificat n'est pas pret
+      debug:
+        msg: >-
+          ATTENTION : le certificat TLS ArgoCD n'est pas encore Ready.
+          Verifie que le DNS de {{ argocd_hostname }} pointe bien vers
+          {{ ansible_host }} et inspecte : kubectl describe certificate
+          -n argocd argocd-server-tls
+      when: cert_status.stdout != "True"
+
+    - name: Recuperer le mot de passe admin initial
+      command: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}"
+      register: argocd_password_b64
+      changed_when: false
+      no_log: true # protege le mot de passe des logs Ansible
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    # --- Resume final ---
+    - name: Afficher les informations d'acces ArgoCD
+      debug:
+        msg: |
+          ArgoCD est installe et accessible :
+          - URL : https://{{ argocd_hostname }}/  (TLS Let's Encrypt via cert-manager)
+          - Utilisateur : admin
+          - Mot de passe : voir la sortie de la tache precedente (base64),
+            decode avec : kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+          - Assure-toi que le DNS de {{ argocd_hostname }} pointe vers {{ ansible_host }}

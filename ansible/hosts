@@ -1,0 +1,65 @@
+# ============================================================
+# Inventaire aligne sur le Terraform multi-AZ (terraform/main.tf) :
+#
+#   Avec az_count=3, master_count=3, worker_count=3 (valeurs par
+#   defaut), Terraform decoupe subnet_cidr (192.168.2.0/24) et
+#   private_subnet_cidr (192.168.3.0/24) en 3 sous-subnets /26 (un
+#   par AZ), et place un master/worker par AZ (round-robin), a
+#   l'hote #10 de chaque subnet :
+#
+#     AZ1 : subnet public 192.168.2.0/26   -> master1 = 192.168.2.10
+#           subnet prive  192.168.3.0/26   -> worker1 = 192.168.3.10
+#     AZ2 : subnet public 192.168.2.64/26  -> master2 = 192.168.2.74
+#           subnet prive  192.168.3.64/26  -> worker2 = 192.168.3.74
+#     AZ3 : subnet public 192.168.2.128/26 -> master3 = 192.168.2.138
+#           subnet prive  192.168.3.128/26 -> worker3 = 192.168.3.138
+#
+#   Si tu changes az_count/master_count/worker_count/subnet_cidr,
+#   recalcule ces IP a partir de `terraform output masters` et
+#   `terraform output workers` (qui donnent aussi l'AZ de chaque
+#   noeud) plutot que de les deduire a la main.
+#
+# IMPORTANT :
+#   - ansible_host des MASTERS = leur IP PUBLIQUE (EIP), car la
+#     connexion SSH se fait depuis l'exterieur du VPC.
+#   - node_private_ip des masters = IP PRIVEE (utilisee par le
+#     playbook pour --node-ip et les URL de join etcd/K3S_URL).
+#   - Les workers n'ont PAS d'IP publique : ansible_host = leur
+#     IP PRIVEE, et la connexion SSH passe par un ProxyJump via
+#     master1 (qui, lui, a un EIP). Le fait que les workers soient
+#     repartis sur 3 AZ/subnets prives differents ne change rien
+#     au ProxyJump : master1 route vers les 3 subnets prives via
+#     le reseau du VPC (routes locales automatiques entre subnets
+#     d'un meme VPC, quelle que soit leur AZ).
+#   - La cle SSH vit dans terraform/keys/ (structure en dossiers) :
+#     chemin relatif ../terraform/keys/ma-cle-ssh car ansible-playbook
+#     s'execute depuis le dossier ansible/.
+#
+# --> Remplace <MASTER1_PUBLIC_IP>, <MASTER2_PUBLIC_IP>,
+#     <MASTER3_PUBLIC_IP> ci-dessous par les valeurs reelles de
+#     `terraform output masters` apres apply (ou lance
+#     scripts/update-hosts.sh qui le fait automatiquement).
+# ============================================================
+[master]
+master1 ansible_host=<MASTER1_PUBLIC_IP> node_private_ip=192.168.2.10 ansible_user=ubuntu ansible_ssh_private_key_file=../terraform/keys/ma-cle-ssh
+master2 ansible_host=<MASTER2_PUBLIC_IP> node_private_ip=192.168.2.74 ansible_user=ubuntu ansible_ssh_private_key_file=../terraform/keys/ma-cle-ssh
+master3 ansible_host=<MASTER3_PUBLIC_IP> node_private_ip=192.168.2.138 ansible_user=ubuntu ansible_ssh_private_key_file=../terraform/keys/ma-cle-ssh
+[worker]
+worker1 ansible_host=192.168.3.10 node_private_ip=192.168.3.10 ansible_user=ubuntu ansible_ssh_private_key_file=../terraform/keys/ma-cle-ssh
+worker2 ansible_host=192.168.3.74 node_private_ip=192.168.3.74 ansible_user=ubuntu ansible_ssh_private_key_file=../terraform/keys/ma-cle-ssh
+worker3 ansible_host=192.168.3.138 node_private_ip=192.168.3.138 ansible_user=ubuntu ansible_ssh_private_key_file=../terraform/keys/ma-cle-ssh
+[k3s_cluster:children]
+master
+worker
+# ------------------------------------------------------------
+# Note : les masters (subnets publics, un par AZ, base
+# 192.168.2.0/24) et les workers (subnets prives, un par AZ, base
+# 192.168.3.0/24) sont dans le meme VPC, repartis sur 3 AZ. Les
+# workers sortent sur Internet (apt, curl get.k3s.io) via un NAT
+# Gateway DEDIE a leur propre AZ (pas de NAT Gateway partage entre
+# AZ), et n'ont pas d'IP publique. master1, qui dispose d'un EIP,
+# sert de bastion pour atteindre les workers en SSH depuis
+# l'exterieur, quelle que soit leur AZ.
+# ------------------------------------------------------------
+[worker:vars]
+ansible_ssh_common_args='-o ProxyCommand="ssh -i ../terraform/keys/ma-cle-ssh -W %h:%p -o StrictHostKeyChecking=no ubuntu@<MASTER1_PUBLIC_IP>" -o StrictHostKeyChecking=no'

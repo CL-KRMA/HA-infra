@@ -1,0 +1,168 @@
+- hosts: "{{ groups['master'][0] }}"
+  become: yes
+  vars:
+    kube_user: "ubuntu"
+    kubeconfig_path: "/home/ubuntu/.kube/config"
+    helm_version: "v3.15.4"
+    # grafana_admin_password N'EST PLUS defini ici en clair : il vient
+    # de ansible/group_vars/master/vault.yml, chiffre via ansible-vault
+    # (voir ansible/group_vars/master/vault.yml.example et le README,
+    # section Securite). Ansible charge group_vars/master/*.yml
+    # automatiquement car ce play cible un hote du groupe [master].
+
+  tasks:
+    # --- Garde-fou : refuse de continuer sans mot de passe Grafana
+    #     defini via le vault (evite un retour silencieux a un defaut
+    #     en clair, ou un echec Helm peu clair plus loin) ---
+    - name: Verifier que grafana_admin_password est defini (via vault)
+      assert:
+        that:
+          - grafana_admin_password is defined
+          - grafana_admin_password | length > 0
+          - grafana_admin_password != "CHANGE_MOI_avant_ansible-vault_encrypt"
+        fail_msg: >-
+          grafana_admin_password n'est pas defini (ou a garde sa valeur
+          placeholder). Cree ansible/group_vars/master/vault.yml a partir
+          de vault.yml.example, personnalise le mot de passe, chiffre-le
+          avec `ansible-vault encrypt ansible/group_vars/master/vault.yml`,
+          puis relance ce playbook avec --ask-vault-pass (voir README,
+          section Securite).
+        success_msg: "grafana_admin_password est bien defini."
+      no_log: true
+
+    # --- Installer Helm (idempotent, version pinnee) ---
+    - name: Telecharger script d'installation Helm
+      get_url:
+        url: "https://raw.githubusercontent.com/helm/helm/{{ helm_version }}/scripts/get-helm-3"
+        dest: /tmp/get_helm.sh
+        mode: '0755'
+
+    - name: Installer Helm
+      command: /tmp/get_helm.sh
+      args:
+        creates: /usr/local/bin/helm
+      environment:
+        DESIRED_VERSION: "{{ helm_version }}"
+
+    # --- Ajouter repo prometheus-community (idempotent) ---
+    - name: Ajouter le repo Helm prometheus-community
+      command: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      register: repo_add
+      changed_when: "'has been added' in repo_add.stdout"
+      failed_when: repo_add.rc != 0 and 'already exists' not in repo_add.stderr
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Mettre a jour les repos Helm
+      command: helm repo update
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    # --- Installer/mettre a jour kube-prometheus-stack ---
+    # Grafana reste en ClusterIP (pas de NodePort) : l'acces externe
+    # passe par l'Ingress Traefik (deja installe par k3s, ports 80/443
+    # deja ouverts dans le security group).
+    - name: Deployer/mettre a jour kube-prometheus-stack (Prometheus + Grafana)
+      command: >
+        helm upgrade --install monitoring prometheus-community/kube-prometheus-stack
+        --namespace monitoring --create-namespace
+        --set grafana.service.type=ClusterIP
+        --set grafana.adminPassword={{ grafana_admin_password }}
+        --set grafana.persistence.enabled=true
+        --set grafana.persistence.size=10Gi
+        --set prometheus.persistence.enabled=true
+        --set prometheus.persistence.size=20Gi
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      no_log: true # protege le mot de passe des logs Ansible
+
+    # --- Ingress Traefik HTTPS : expose Grafana sur le port 443 du
+    #     cluster, certificat Let's Encrypt gere automatiquement par
+    #     cert-manager (ClusterIssuer letsencrypt-prod, voir
+    #     playbooks/install-cert-manager.yml, doit tourner AVANT ce
+    #     playbook). Le TLS est termine par Traefik ; le trafic
+    #     Ingress -> service Grafana reste en HTTP interne au cluster.
+    - name: Deployer le manifest Ingress pour Grafana
+      copy:
+        dest: /tmp/grafana-ingress.yaml
+        content: |
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: grafana-ingress
+            namespace: monitoring
+            annotations:
+              traefik.ingress.kubernetes.io/router.entrypoints: websecure
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+          spec:
+            ingressClassName: traefik
+            tls:
+              - hosts:
+                  - monitoring.domain.com
+                secretName: grafana-tls
+            rules:
+              - host: monitoring.domain.com
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: monitoring-grafana
+                          port:
+                            number: 80
+
+    - name: Appliquer l'Ingress Grafana
+      command: kubectl apply -f /tmp/grafana-ingress.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    # --- Verifications ---
+    - name: Attendre que les pods monitoring soient prets
+      command: kubectl get pods -n monitoring
+      register: result
+      retries: 20
+      delay: 15
+      until: "'ContainerCreating' not in result.stdout and 'Pending' not in result.stdout"
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - debug:
+        msg: "{{ result.stdout }}"
+
+    - name: Verifier le service Grafana
+      command: kubectl get svc -n monitoring monitoring-grafana
+      register: grafana_svc
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - debug:
+        msg: "{{ grafana_svc.stdout }}"
+
+    # --- Verifier que le certificat Let's Encrypt a bien ete emis ---
+    - name: Attendre que le certificat TLS Grafana soit Ready
+      command: kubectl get certificate -n monitoring grafana-tls -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}"
+      register: cert_status
+      retries: 15
+      delay: 15
+      until: cert_status.stdout == "True"
+      changed_when: false
+      failed_when: false
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Avertissement si le certificat n'est pas pret
+      debug:
+        msg: >-
+          ATTENTION : le certificat TLS Grafana n'est pas encore Ready.
+          Verifie que le DNS de monitoring.domain.com pointe bien vers
+          {{ ansible_host }} et inspecte : kubectl describe certificate
+          -n monitoring grafana-tls
+      when: cert_status.stdout != "True"
+
+    - name: Afficher l'URL d'acces Grafana
+      debug:
+        msg: "Grafana accessible via : https://monitoring.domain.com/  (TLS Let's Encrypt, utilisateur: admin)"
