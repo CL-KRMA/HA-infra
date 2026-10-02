@@ -1,4 +1,23 @@
 # ============================================================
+# Versions Terraform / providers
+# ============================================================
+# Le fichier .terraform.lock.hcl (versionne dans git) fige la version
+# EXACTE du provider ; la contrainte ci-dessous n'est qu'un garde-fou.
+# 'domain = "vpc"' sur aws_eip exige un provider AWS >= 5.0.
+# Pour monter volontairement de version : terraform init -upgrade,
+# puis committer le nouveau .terraform.lock.hcl.
+terraform {
+  required_version = ">= 1.5, < 2.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0, < 7.0"
+    }
+  }
+}
+
+# ============================================================
 # Variables
 # ============================================================
 variable "region" {
@@ -20,7 +39,7 @@ variable "instance_type" {
 }
 
 variable "ami_id" {
-  description = "AMI Ubuntu 22.04 LTS (us-east-1)"
+  description = "AMI Ubuntu 22.04 LTS (us-east-1) - a verifier/mettre a jour si l'AMI est retiree (fin de support standard Ubuntu 22.04 : 2027)"
   type        = string
   default     = "ami-08c40ec9ead489470"
 }
