@@ -39,6 +39,7 @@ un stack de monitoring (Prometheus + Grafana).
 ha-infra/
 ├── terraform/
 │   ├── main.tf              # Infra AWS (VPC, subnets, EC2, SG, EIP)
+│   ├── .terraform.lock.hcl  # Versions exactes des providers (versionné)
 │   └── keys/                # Clé SSH (gitignored, à créer soi-même)
 │       ├── ma-cle-ssh
 │       └── ma-cle-ssh.pub
@@ -61,6 +62,7 @@ ha-infra/
 │   ├── update-hosts.sh
 │   └── set-domain.sh        # Remplace domain.com par ton propre domaine
 ├── .gitignore
+├── .gitattributes
 └── README.md
 ```
 
@@ -100,13 +102,15 @@ cd ..
 # 1. Sécuriser la clé SSH
 chmod 600 terraform/keys/ma-cle-ssh
 
-# 1bis. Remplacer le domaine d'exemple (domain.com) par le tien
-chmod +x scripts/set-domain.sh
+# 1bis. Rendre les scripts exécutables (une seule fois), puis remplacer
+#       le domaine d'exemple (domain.com) par le tien
+chmod +x scripts/update-ip.sh scripts/update-hosts.sh scripts/set-domain.sh
 ./scripts/set-domain.sh mondomaine.fr
 
 # 2. Détecter son IP publique et appliquer le Terraform
-#    (génère terraform/terraform.tfvars puis lance `terraform apply`)
-chmod +x scripts/update-ip.sh scripts/update-hosts.sh scripts/set-domain.sh
+#    (lance `terraform init`, génère terraform/terraform.tfvars
+#    puis lance `terraform apply` : le plan est affiché et il faut
+#    taper "yes" pour confirmer ; ajouter -y pour ignorer la confirmation)
 ./scripts/update-ip.sh
 
 # 3. Injecter les IP publiques des masters dans l'inventaire ansible/hosts
