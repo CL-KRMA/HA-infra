@@ -15,9 +15,11 @@ un stack de monitoring (Prometheus + Grafana).
   - Masters et workers sont répartis en round-robin sur les 3 AZ : un
     master + un worker par AZ (voir `terraform output masters` /
     `terraform output workers` pour le détail IP/AZ de chaque noeud).
-- **master1** sert de bastion SSH (ProxyJump) pour atteindre les
-  workers, quelle que soit leur AZ (routage interne au VPC, natif
-  entre subnets d'un même VPC).
+- **master1** sert de bastion SSH (ProxyJump) par défaut, défini dans
+  `ansible/hosts`, pour atteindre les workers quelle que soit leur AZ
+  (routage interne au VPC, natif entre subnets d'un même VPC). Ce n'est
+  pas une contrainte technique : n'importe quel master peut jouer ce
+  rôle (security group commun, SSH autorisé entre nœuds).
 - **K3s HA** : etcd embarqué, quorum sur les 3 masters (répartis sur 3
   AZ) — la perte d'une AZ laisse 2 masters actifs, majoritaires pour
   le quorum etcd, et 2 workers.
@@ -82,10 +84,12 @@ ha-infra/
   `./scripts/set-domain.sh mondomaine.fr` (voir étape 1bis ci-dessous).
 - **Pour le TLS Let's Encrypt** : les DNS de `argocd.domain.com` et
   `monitoring.domain.com` (une fois remplacés par ton domaine) doivent
-  déjà pointer vers l'IP publique de `master1` (EIP donnée par
-  `terraform output master1_public_ip`) **avant** de lancer l'étape
-  cert-manager — le challenge HTTP-01 est validé par Let's Encrypt
-  depuis l'extérieur, sur le port 80.
+  déjà pointer vers les IP publiques des **3 masters** (un
+  enregistrement A par master, EIP données par `terraform output
+  masters`) **avant** de lancer l'étape cert-manager — le challenge
+  HTTP-01 est validé par Let's Encrypt depuis l'extérieur, sur le port
+  80, et les 3 IP doivent donc répondre. Pointer vers un seul master
+  rend les sites injoignables si celui-ci tombe.
 - **Mot de passe Grafana (ansible-vault)** : `ansible-vault` installé
   (fourni avec Ansible). Voir étape 3ter ci-dessous — le playbook
   monitoring refuse de s'exécuter tant que le mot de passe n'est pas
@@ -117,8 +121,9 @@ chmod +x scripts/update-ip.sh scripts/update-hosts.sh scripts/set-domain.sh
 ./scripts/update-hosts.sh
 
 # 3bis. Pointer les DNS argocd.domain.com et monitoring.domain.com vers
-#       l'IP publique de master1 (terraform output master1_public_ip),
-#       et attendre la propagation avant l'étape 4.
+#       les IP publiques des 3 masters (3 enregistrements A chacun,
+#       voir terraform output masters), et attendre la propagation
+#       avant l'étape 4.
 
 # 3ter. Configurer le mot de passe Grafana (ansible-vault, une fois)
 cp ansible/group_vars/master/vault.yml.example ansible/group_vars/master/vault.yml
@@ -269,8 +274,40 @@ interfaces sont accessibles en HTTPS (certificat Let's Encrypt) :
 
 - `terraform output masters` vide/erreur → vérifier qu'un `terraform
   apply` a bien abouti dans `terraform/`.
-- SSH vers un worker échoue → vérifier que master1 est bien joignable
-  (bastion via ProxyJump) et que `terraform/keys/ma-cle-ssh` est en `600`.
+- SSH vers un worker échoue → vérifier que le master utilisé comme
+  bastion est bien joignable et que `terraform/keys/ma-cle-ssh` est en
+  `600`. Les workers n'ont pas d'IP publique : on y accède en passant
+  par un master (n'importe lequel). Depuis la racine du projet :
+
+  ```bash
+  ssh -i terraform/keys/ma-cle-ssh \
+    -o ProxyCommand="ssh -i terraform/keys/ma-cle-ssh -W %h:%p ubuntu@<MASTER_PUBLIC_IP>" \
+    ubuntu@<WORKER_PRIVATE_IP>
+  ```
+
+  `<MASTER_PUBLIC_IP>` : IP publique d'un master (`terraform output
+  masters`) ; `<WORKER_PRIVATE_IP>` : IP privée du worker (par défaut
+  `192.168.3.10`, `192.168.3.74`, `192.168.3.138`, voir
+  `terraform output workers`). La clé est fournie aux deux connexions
+  (une fois dans la commande principale, une fois dans le
+  `ProxyCommand`) et reste sur ta machine : ne la copie jamais sur un
+  master.
+- `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED` (ou `Host key
+  verification failed`) après avoir recréé le cluster → les IP privées
+  des workers sont identiques mais leurs clés SSH ont changé. Vérifier
+  que l'empreinte affichée est bien celle du nouveau serveur, puis
+  supprimer l'ancienne entrée de `~/.ssh/known_hosts` :
+
+  ```bash
+  ssh-keygen -R <IP>
+  # tous les workers (IP par défaut) et les masters d'un coup :
+  for ip in 192.168.3.10 192.168.3.74 192.168.3.138 <MASTER_PUBLIC_IP>; do
+    ssh-keygen -R "$ip"
+  done
+  ```
+
+  Les EIP des masters changent aussi à chaque recréation : supprimer
+  leurs anciennes entrées de la même façon.
 - `kubectl get nodes` incomplet → relancer `ansible-playbook site.yml
   --tags k3s` depuis `ansible/`, les tâches sont idempotentes
   (`creates:` sur les installations k3s).
@@ -285,7 +322,7 @@ interfaces sont accessibles en HTTPS (certificat Let's Encrypt) :
   publique (voir section « Piloter le cluster depuis ta machine »).
 - Certificat TLS jamais `Ready` (`kubectl describe certificate -n
   argocd argocd-server-tls` ou `-n monitoring grafana-tls`) → vérifier
-  que le DNS pointe bien vers l'IP publique de master1 et que le port
-  80 est bien accessible depuis Internet (challenge HTTP-01) ; inspecter
+  que le DNS pointe bien vers les IP publiques des 3 masters et que le
+  port 80 est bien accessible depuis Internet (challenge HTTP-01) ; inspecter
   aussi `kubectl describe challenge -A` et
   `kubectl logs -n cert-manager deploy/cert-manager`.
